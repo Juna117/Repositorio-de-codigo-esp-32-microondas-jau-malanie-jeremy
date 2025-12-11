@@ -1,0 +1,302 @@
+/*
+   PROYECTO FINAL: MICROONDAS ESP32 (RELOJ + TEMPORIZADOR)
+   CUMPLIMIENTO: Documento 3.1, 3.2 y 3.3
+   HARDWARE: Display Ánodo Común + PNP + Sensor Puerta
+*/
+
+#include <Keypad.h>
+
+// ==========================================
+// 1. CONFIGURACIÓN DE PINES
+// ==========================================
+// Segmentos A-G (Resistencias 220ohm)
+const int PINES_SEGMENTOS[] = {14, 27, 26, 25, 33, 32, 13};
+// Dígitos D1-D4 (Base Transistores PNP)
+const int PINES_DIGITOS[] = {19, 18, 5, 17};
+
+// Periféricos
+const int PIN_BUZZER = 12;
+const int PIN_LED_PUNTOS = 3;  // LED ":" del reloj (RX)
+const int PIN_LED_COCINA = 1;  // LED indicador de cocción (TX)
+const int PIN_SENSOR_PUERTA = 34; // Requiere resistencia Pull-Down a GND
+
+// Teclado 4x4
+const byte FILAS = 4; const byte COLUMNAS = 4;
+char teclas[FILAS][COLUMNAS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'}, // C = Cancelar / Parar
+  {'*','0','#','D'}  // * = Editar Reloj, # = Iniciar Cocción
+};
+byte pinesFilas[FILAS] = {23, 22, 21, 15};
+byte pinesColumnas[COLUMNAS] = {4, 16, 2, 0};
+Keypad teclado = Keypad(makeKeymap(teclas), pinesFilas, pinesColumnas, FILAS, COLUMNAS);
+
+// ==========================================
+// 2. VARIABLES Y ESTADOS
+// ==========================================
+const byte NUMEROS[10][7] = {
+  {1,1,1,1,1,1,0}, {0,1,1,0,0,0,0}, {1,1,0,1,1,0,1}, {1,1,1,1,0,0,1},
+  {0,1,1,0,0,1,1}, {1,0,1,1,0,1,1}, {1,0,1,1,1,1,1}, {1,1,1,0,0,0,0},
+  {1,1,1,1,1,1,1}, {1,1,1,1,0,1,1}
+};
+
+// Caracteres para "End"
+const byte CHAR_OFF[7] = {0,0,0,0,0,0,0};
+const byte CHAR_E[7]   = {1,0,0,1,1,1,1};
+const byte CHAR_n[7]   = {0,0,1,0,1,0,1};
+const byte CHAR_d[7]   = {0,1,1,1,1,0,1};
+
+enum Estado {
+  MODO_RELOJ,           // Muestra hora
+  MODO_EDICION_HORA,    // Editando hora (*)
+  MODO_MICRO_INPUT,     // Ingresando tiempo (números)
+  MODO_COCINANDO,       // Cuenta regresiva
+  MODO_FIN_MELODIA,     // Fase 1: Melodía 5s
+  MODO_FIN_BIPS         // Fase 2: Bips 5s
+};
+Estado estadoActual = MODO_RELOJ;
+
+// Variables Globales
+int horas = 12, minutos = 0, segundos = 0;
+unsigned long lastMillisReloj = 0;
+
+int buffer = 0;           // Buffer de entrada (Shift Left)
+int tiempoCoccion = 0;    // Segundos totales
+unsigned long lastMillisCocina = 0;
+unsigned long tiempoInicioFin = 0; // Para controlar la secuencia de 10s
+
+int digitos[4] = {0,0,0,0}; 
+int displayIndex = 0;
+bool mostrarMensajeEnd = false;
+
+// ==========================================
+// 3. FUNCIONES DE PANTALLA
+// ==========================================
+
+void prepararDisplay(int valor, bool esReloj) {
+  int d1, d2, d3, d4;
+  
+  if (esReloj) { // Formato HH:MM
+    d1 = horas / 10; d2 = horas % 10;
+    d3 = minutos / 10; d4 = minutos % 10;
+  } else { // Formato MM:SS (Timer o Buffer)
+    int m, s;
+    if (estadoActual == MODO_COCINANDO) {
+      m = valor / 60; s = valor % 60;
+    } else {
+      // En input asumimos formato decimal directo (ej. 205 = 2:05)
+      m = valor / 100; s = valor % 100;
+    }
+    d1 = m / 10; d2 = m % 10;
+    d3 = s / 10; d4 = s % 10;
+  }
+  digitos[0]=d1; digitos[1]=d2; digitos[2]=d3; digitos[3]=d4;
+}
+
+void multiplexar() {
+  // 1. Apagar todo (PNP -> HIGH)
+  for(int i=0; i<4; i++) digitalWrite(PINES_DIGITOS[i], HIGH);
+
+  const byte* patron;
+  bool encender = true;
+
+  if (mostrarMensajeEnd) {
+    // Mostrar "End "
+    if(displayIndex == 0) patron = CHAR_E;
+    else if(displayIndex == 1) patron = CHAR_n;
+    else if(displayIndex == 2) patron = CHAR_d;
+    else { patron = CHAR_OFF; encender = false; }
+  } else {
+    // REGLA: SIN CEROS A LA IZQUIERDA
+    // Si estamos en D1 y es 0, lo apagamos.
+    if (displayIndex == 0 && digitos[0] == 0) {
+      encender = false;
+    }
+    // Si D1 y D2 son 0 (ej 00:45), apagar D2 también (mostrar :45)
+    // PERO: Si es reloj (HH:MM), siempre mostramos D2 (ej 0:05)
+    // Ajuste según tu ejemplo: 2:05. Si fuese 0:45 -> Apagar D1 y D2 en timer.
+    if (estadoActual != MODO_RELOJ && estadoActual != MODO_EDICION_HORA) {
+       if (displayIndex == 1 && digitos[0] == 0 && digitos[1] == 0) encender = false;
+    }
+    
+    patron = NUMEROS[digitos[displayIndex]];
+  }
+
+  if (encender) {
+    for(int i=0; i<7; i++) digitalWrite(PINES_SEGMENTOS[i], !patron[i]);
+    digitalWrite(PINES_DIGITOS[displayIndex], LOW);
+  }
+
+  delay(4);
+  displayIndex++;
+  if(displayIndex > 3) displayIndex = 0;
+}
+
+// ==========================================
+// 4. LÓGICA Y CONTROL
+// ==========================================
+void bip() { tone(PIN_BUZZER, 2000, 50); }
+void bipLargo() { tone(PIN_BUZZER, 2000, 500); }
+
+void verificarPuerta() {
+  // Si se abre la puerta (HIGH) mientras cocina -> CANCELAR
+  if (digitalRead(PIN_SENSOR_PUERTA) == HIGH && estadoActual == MODO_COCINANDO) {
+    estadoActual = MODO_RELOJ;
+    digitalWrite(PIN_LED_COCINA, LOW);
+    tone(PIN_BUZZER, 500, 500); // Sonido Error
+  }
+}
+
+// ==========================================
+// 5. LOOP PRINCIPAL
+// ==========================================
+void loop() {
+  multiplexar();
+  verificarPuerta();
+  
+  char tecla = teclado.getKey();
+  unsigned long ms = millis();
+
+  switch (estadoActual) {
+
+    // --- MODO RELOJ ---
+    case MODO_RELOJ:
+      mostrarMensajeEnd = false;
+      if (ms - lastMillisReloj >= 1000) {
+        lastMillisReloj = ms;
+        segundos++;
+        if (segundos >= 60) { segundos = 0; minutos++; }
+        if (minutos >= 60) { minutos = 0; horas++; }
+        if (horas >= 24) horas = 0;
+      }
+      // LED Puntos parpadea
+      digitalWrite(PIN_LED_PUNTOS, (ms % 1000) < 500);
+      
+      prepararDisplay(0, true);
+
+      // Tecla *: Editar Hora
+      if (tecla == '*') {
+        estadoActual = MODO_EDICION_HORA;
+        buffer = 0;
+        digitalWrite(PIN_LED_PUNTOS, HIGH); // Fijo
+        bip();
+      }
+      // Tecla NÚMERO: Ir directo a Timer
+      else if (isdigit(tecla)) {
+        estadoActual = MODO_MICRO_INPUT;
+        buffer = tecla - '0'; // Iniciar con el número presionado
+        digitalWrite(PIN_LED_PUNTOS, LOW); // Apagar puntos
+        bip();
+      }
+      break;
+
+    // --- MODO EDICIÓN HORA ---
+    case MODO_EDICION_HORA:
+      if (isdigit(tecla)) {
+        bip();
+        buffer = (buffer * 10 + (tecla - '0')) % 10000;
+      }
+      prepararDisplay(buffer, false); // false = buffer
+
+      if (tecla == '*') { // Guardar
+        int h = buffer / 100; int m = buffer % 100;
+        if (h < 24 && m < 60) {
+          horas = h; minutos = m; segundos = 0;
+          bipLargo();
+          estadoActual = MODO_RELOJ;
+        } else {
+          buffer = 0; tone(PIN_BUZZER, 500, 300);
+        }
+      }
+      break;
+
+    // --- MODO MICRO INPUT (Tiempo Cocción) ---
+    case MODO_MICRO_INPUT:
+      if (isdigit(tecla)) {
+        bip();
+        buffer = (buffer * 10 + (tecla - '0')) % 10000;
+      }
+      prepararDisplay(buffer, false); // Muestra formato MM:SS
+
+      if (tecla == '#') { // START
+        int m = buffer / 100; int s = buffer % 100;
+        tiempoCoccion = (m * 60) + s;
+        if (tiempoCoccion > 0) {
+          estadoActual = MODO_COCINANDO;
+          lastMillisCocina = ms;
+          digitalWrite(PIN_LED_COCINA, HIGH); // LED ON
+          bipLargo();
+        }
+      }
+      if (tecla == 'C') { // Cancelar
+        estadoActual = MODO_RELOJ;
+        bip();
+      }
+      break;
+
+    // --- MODO COCINANDO (Cuenta Regresiva) ---
+    case MODO_COCINANDO:
+      if (ms - lastMillisCocina >= 1000) {
+        lastMillisCocina = ms;
+        tiempoCoccion--;
+        if (tiempoCoccion < 0) {
+          // FIN
+          estadoActual = MODO_FIN_MELODIA;
+          tiempoInicioFin = ms;
+          mostrarMensajeEnd = true;
+          digitalWrite(PIN_LED_COCINA, LOW);
+        }
+      }
+      prepararDisplay(tiempoCoccion, false);
+
+      if (tecla == 'C') { // Stop
+        estadoActual = MODO_RELOJ;
+        digitalWrite(PIN_LED_COCINA, LOW);
+        bip();
+      }
+      break;
+
+    // --- MODO FIN FASE 1: MELODÍA (0-5s) ---
+    case MODO_FIN_MELODIA:
+      digitalWrite(PIN_LED_COCINA, (ms / 250) % 2 == 0); // Parpadeo rápido
+      
+      // Melodía simple sin delay
+      {
+        int notas[] = {1000, 1200, 1500, 2000, 1500};
+        int paso = ((ms - tiempoInicioFin) / 250) % 5; 
+        tone(PIN_BUZZER, notas[paso]);
+      }
+
+      if (ms - tiempoInicioFin > 5000) {
+        estadoActual = MODO_FIN_BIPS;
+      }
+      break;
+
+    // --- MODO FIN FASE 2: BIPS (5-10s) ---
+    case MODO_FIN_BIPS:
+      digitalWrite(PIN_LED_COCINA, (ms / 500) % 2 == 0); // Parpadeo lento
+      
+      // 1 bip por segundo
+      if ((ms - tiempoInicioFin) % 1000 < 100) tone(PIN_BUZZER, 2000);
+      else noTone(PIN_BUZZER);
+
+      if (ms - tiempoInicioFin > 10000) {
+        noTone(PIN_BUZZER);
+        digitalWrite(PIN_LED_COCINA, LOW);
+        estadoActual = MODO_RELOJ;
+      }
+      break;
+  }
+}
+
+void setup() {
+  for(int i=0; i<7; i++) pinMode(PINES_SEGMENTOS[i], OUTPUT);
+  for(int i=0; i<4; i++) pinMode(PINES_DIGITOS[i], OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED_PUNTOS, OUTPUT);
+  pinMode(PIN_LED_COCINA, OUTPUT);
+  pinMode(PIN_SENSOR_PUERTA, INPUT); // Pull-Down 10k externa
+  
+  bip();
+}
